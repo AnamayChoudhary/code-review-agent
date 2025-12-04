@@ -11,17 +11,37 @@ import logging
 import re
 import time
 import random
+import uuid
+from collections import deque
+import io
 
 logging.basicConfig(level=logging.DEBUG)
 
 mcp = FastMCP(host="0.0.0.0", stateless_http=True)
 
-def bedrock_invoke_with_retry(client, max_attempts: int = 10, initial_backoff: float = 1.0, **kwargs):
-    """Invoke Bedrock with exponential backoff + jitter on throttling (429 / ThrottlingException)."""
+#Session ID for context
+session_id = str(uuid.uuid4())
+
+
+def bedrock_converse_with_retry(client, model_id: str, messages: list, inference_config: dict = None,
+                                max_attempts: int = 10, initial_backoff: float = 1.0, session_id: str = None):
+    """
+    Converse with Bedrock using exponential backoff + jitter on throttling (429 / ThrottlingException).
+    Supports multi-turn conversations via requestMetadata.sessionId.
+    """
     backoff = initial_backoff
     for attempt in range(1, max_attempts + 1):
         try:
-            return client.invoke_model(**kwargs)
+            response = client.converse(
+                modelId=model_id,
+                requestMetadata={"sessionId": session_id} if session_id else None,
+                messages=messages,
+                inferenceConfig=inference_config or {
+                    "temperature": 0.7,
+                    "maxTokens": 512
+                }
+            )
+            return response
         except Exception as e:
             err = str(e)
             is_throttle = "ThrottlingException" in err or "Too many requests" in err or "429" in err
@@ -31,6 +51,125 @@ def bedrock_invoke_with_retry(client, max_attempts: int = 10, initial_backoff: f
             logging.warning("Bedrock throttled (attempt %d/%d). Retry in %.2fs", attempt, max_attempts, sleep_for)
             time.sleep(sleep_for)
             backoff *= 2
+
+
+# --- new: streaming-friendly wrapper that returns decoded text with retry/backoff ---
+
+def bedrock_converse_stream_with_retry(client, model_id: str, messages: list = None, inference_config: dict = None,
+                                       max_attempts: int = 10, initial_backoff: float = 1.0, session_id: str = None,
+                                       encoding: str = "utf-8"):
+    """
+    Try to get a streaming 'converse' response when available, falling back to non-streaming converse or invoke_model.
+    Returns a dict-like response with key 'body' containing a bytes-like file object (io.BytesIO) so callers can
+    call resp.get('body').read() as before.
+    """
+    backoff = initial_backoff
+    last_exc = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 1) prefer streaming converse if available
+            if hasattr(client, "converse_stream"):
+                resp = client.converse_stream(
+                    modelId=model_id,
+                    requestMetadata={"sessionId": session_id} if session_id else None,
+                    messages=messages,
+                    inferenceConfig=inference_config or {"temperature": 0.7, "maxTokens": 512}
+                )
+                pieces = []
+                # resp["stream"] is expected to be an iterable of events
+                for event in resp.get("stream", []):
+                    # common bedrock streaming event shapes include contentBlockDelta / text deltas
+                    if isinstance(event, dict):
+                        if "contentBlockDelta" in event:
+                            delta = event["contentBlockDelta"].get("delta", {})
+                            if "text" in delta:
+                                pieces.append(delta["text"].encode(encoding, errors="replace"))
+                        elif "text" in event:
+                            pieces.append(str(event["text"]).encode(encoding, errors="replace"))
+                        elif "messageStop" in event:
+                            break
+                raw = b"".join(pieces)
+                return {"body": io.BytesIO(raw)}
+
+            # 2) try non-streaming converse (multi-turn chat)
+            if hasattr(client, "converse"):
+                resp = client.converse(
+                    modelId=model_id,
+                    requestMetadata={"sessionId": session_id} if session_id else None,
+                    messages=messages,
+                    inferenceConfig=inference_config or {"temperature": 0.7, "maxTokens": 512}
+                )
+                # Many SDKs return response with 'body' that may be bytes or a str or file-like
+                body_obj = resp.get("body", None)
+                if body_obj is None:
+                    # attempt to synthesize text from known keys
+                    text = ""
+                    if isinstance(resp, dict):
+                        # try common keys
+                        text = resp.get("completion") or resp.get("output") or resp.get("generated_text") or ""
+                    return {"body": io.BytesIO(str(text).encode(encoding, errors="replace"))}
+                # if body is file-like, try to read it
+                try:
+                    if hasattr(body_obj, "read"):
+                        raw = body_obj.read()
+                        if isinstance(raw, str):
+                            raw = raw.encode(encoding, errors="replace")
+                        return {"body": io.BytesIO(raw)}
+                    if isinstance(body_obj, bytes):
+                        return {"body": io.BytesIO(body_obj)}
+                    return {"body": io.BytesIO(str(body_obj).encode(encoding, errors="replace"))}
+                except Exception:
+                    return {"body": io.BytesIO(str(body_obj).encode(encoding, errors="replace"))}
+
+            # 3) final fallback: invoke_model (common boto3 runtime API)
+            if hasattr(client, "invoke_model"):
+                resp = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps({"messages": messages}) if messages is not None else json.dumps({}),
+                    contentType="application/json",
+                    accept="application/json",
+                    requestMetadata={"sessionId": session_id} if session_id else None,
+                )
+                body_obj = resp.get("body")
+                # try streaming read if available
+                try:
+                    if hasattr(body_obj, "read"):
+                        pieces = []
+                        # read in loop defensively
+                        while True:
+                            chunk = body_obj.read(4096)
+                            if not chunk:
+                                break
+                            if isinstance(chunk, str):
+                                pieces.append(chunk.encode(encoding, errors="replace"))
+                            else:
+                                pieces.append(chunk)
+                        raw = b"".join(pieces)
+                        return {"body": io.BytesIO(raw)}
+                    else:
+                        if isinstance(body_obj, bytes):
+                            return {"body": io.BytesIO(body_obj)}
+                        return {"body": io.BytesIO(str(body_obj or "").encode(encoding, errors="replace"))}
+                except Exception:
+                    return {"body": io.BytesIO(str(body_obj or "").encode(encoding, errors="replace"))}
+
+            # If client supports none of the above, raise
+            raise RuntimeError("Bedrock client does not support converse_stream, converse, or invoke_model")
+
+        except Exception as e:
+            last_exc = e
+            err = str(e)
+            is_throttle = "ThrottlingException" in err or "Too many requests" in err or "429" in err
+            if not is_throttle or attempt == max_attempts:
+                raise
+            sleep_for = backoff + random.random() * backoff
+            logging.warning("Bedrock converse throttled (attempt %d/%d). Retry in %.2fs", attempt, max_attempts, sleep_for)
+            time.sleep(sleep_for)
+            backoff *= 2
+
+    raise last_exc if last_exc else RuntimeError("bedrock_converse_stream_with_retry failed without exception")
+
 
 @mcp.tool()
 def analyze_git_repo(repo_url: str) -> str:
@@ -107,7 +246,7 @@ def analyze_git_repo(repo_url: str) -> str:
         # --- Call Bedrock model to summarize / provide suggestions ---
         try:
             region = os.getenv("AWS_REGION", "us-east-1")
-            model_id = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-70b-instruct-v1:0")  # set model id in env
+            model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")  # set model id in env
             if not model_id:
                 report += "\n\n--- Bedrock skipped: no BEDROCK_MODEL_ID set ---\n"
                 return report
@@ -127,12 +266,17 @@ def analyze_git_repo(repo_url: str) -> str:
 
             # Example with explicit model and payload
             logging.info(f"Calling Bedrock model {model_id} with payload: {json.dumps(payload)}")
-            response = bedrock_invoke_with_retry(
+            response = bedrock_converse_stream_with_retry(
                 bedrock,
-                modelId=model_id,
-                body=json.dumps(payload),
-                contentType="application/json",
-                accept="application/json",
+                model_id=model_id,
+                messages=[
+                    {"role": "user", "content": [{"text": prompt}]}
+                ],
+                inference_config={
+                    "temperature": 0.7,
+                    "maxTokens": 512
+                },
+                session_id=session_id  # Optional for context
             )
 
             # Read and decode response body robustly
@@ -297,6 +441,10 @@ def analyze_git_repo(repo_url: str) -> str:
                 # rate limit control: seconds to wait between per-chunk Bedrock calls
                 per_chunk_delay = float(os.getenv("PER_CHUNK_DELAY", "3.0"))
 
+                # context window: keep last N parsed analyses and use them for final synthesis
+                CONTEXT_WINDOW = int(os.getenv("CONTEXT_WINDOW", "15"))
+                recent_context = deque(maxlen=CONTEXT_WINDOW)
+
                 for i, chunk_text in enumerate(chunks, start=1):
                     part_prompt_instructions = (
                         f"PART {i}/{len(chunks)}\n"
@@ -344,68 +492,21 @@ def analyze_git_repo(repo_url: str) -> str:
                         logging.exception("Failed to save part payload")
 
                     try:
-                        resp = bedrock_invoke_with_retry(
+                        # use streaming wrapper for per-chunk analysis
+                        decoded = bedrock_converse_stream_with_retry(
                             bedrock,
-                            modelId=model_id,
-                            body=json.dumps(part_payload),
-                            contentType="application/json",
-                            accept="application/json",
+                            model_id=model_id,
+                            messages=[
+                                {"role": "user", "content": [{"text": part_prompt}]}
+                            ],
+                            inference_config={
+                                "temperature": 0.7,
+                                "maxTokens": 512
+                            },
+                            session_id=session_id  # pass session id for multi-turn context
                         )
-                        body_obj = resp.get("body")
-                        if hasattr(body_obj, "read"):
-                            decoded = body_obj.read().decode("utf-8", "replace")
-                        else:
-                            decoded = str(body_obj or "")
 
-                        # ensure payload_dir exists before saving responses
-                        try:
-                            os.makedirs(payload_dir, exist_ok=True)
-                        except Exception:
-                            logging.exception("Failed to ensure payload_dir exists")
-
-                        # Save raw response immediately so it's available even if parsing fails
-                        try:
-                            raw_fn = os.path.join(payload_dir, f"part_{i:03d}_raw.txt")
-                            with open(raw_fn, "w", encoding="utf-8") as rf:
-                                rf.write(decoded or "")
-                            logging.debug("Saved raw part response: %s", raw_fn)
-                        except Exception:
-                            logging.exception("Failed to save raw part response")
-
-                        parsed = None
-                        try:
-                            parsed = json.loads(decoded)
-                        except Exception:
-                            m = re.search(r"\{.*\}", decoded, re.S)
-                            if m:
-                                try:
-                                    parsed = json.loads(m.group(0))
-                                except Exception:
-                                    parsed = {"raw": decoded.strip()}
-                            else:
-                                parsed = {"raw": decoded.strip()}
-
-                        # persist the part response (raw + parsed) to a text file for inspection
-                        try:
-                            resp_fn = os.path.join(payload_dir, f"part_{i:03d}_response.txt")
-                            with open(resp_fn, "w", encoding="utf-8") as rf:
-                                rf.write("=== RAW RESPONSE ===\n")
-                                rf.write(decoded or "")
-                                rf.write("\n\n=== PARSED JSON ===\n")
-                                try:
-                                    rf.write(json.dumps(parsed, indent=2, ensure_ascii=False))
-                                except Exception:
-                                    rf.write(str(parsed))
-                            logging.debug("Saved Bedrock part response: %s", resp_fn)
-                        except Exception:
-                            logging.exception("Failed to save part response")
-
-                        analyses.append(parsed)
-                        # small delay between per-chunk calls to reduce throttle risk
-                        try:
-                            time.sleep(per_chunk_delay)
-                        except Exception:
-                            time.sleep(0.5)
+                        # decoded is a str
                     except Exception as ex:
                         logging.exception("Per-chunk Bedrock call failed")
                         analyses.append({"error": str(ex)})
@@ -415,11 +516,39 @@ def analyze_git_repo(repo_url: str) -> str:
                         except Exception:
                             time.sleep(0.5)
 
+                    # attach metadata and maintain recent_context
+                    try:
+                        parsed_obj = None
+                        try:
+                            parsed_obj = json.loads(decoded)
+                        except Exception:
+                            parsed_obj = {"generation": decoded.strip()}
+                        # enrich with part metadata for the synthesizer
+                        parsed_obj.setdefault("part_index", i)
+                        parsed_obj.setdefault("total_parts", len(chunks))
+                        parsed_obj.setdefault("repo_path", repo_path)
+                        analyses.append(parsed_obj)
+                        if 'recent_context' in locals():
+                            recent_context.append(parsed_obj)
+                        else:
+                            # create recent_context if not present
+                            recent_context = deque([parsed_obj], maxlen=int(os.getenv("CONTEXT_WINDOW", "5")))
+                    except Exception:
+                        logging.debug("Failed to attach part metadata to context", exc_info=True)
+
                 # Build a compact / safe synth prompt that keeps total tokens below the model limit
-                # summarize per-chunk analyses to reduce prompt length
+                # Use the recent context (last few parsed analyses) rather than the full analyses list
+                ctx_list = list(recent_context) if 'recent_context' in locals() else analyses
                 summarized = []
-                for a in analyses:
+                for a in ctx_list:
                     entry = {}
+                    # attach lightweight metadata for better synthesis context
+                    # prefer explicit part index keys if the per-part parser added them,
+                    # otherwise leave as null/unknown
+                    entry["part_index"] = a.get("part_index") if isinstance(a, dict) else None
+                    entry["total_parts"] = a.get("total_parts") if isinstance(a, dict) else len(chunks)
+                    entry["repo_path"] = repo_path
+
                     # prefer explicit keys if present, else try to extract from raw generation
                     if isinstance(a, dict):
                         entry["summary"] = (a.get("summary") or a.get("generation") or "")[:1000]
@@ -442,23 +571,23 @@ def analyze_git_repo(repo_url: str) -> str:
                 synth_inputs_trimmed = json.dumps(summarized, indent=2, ensure_ascii=False)
                 # ensure synth prompt stays within token budget
                 
-                formatted_prompt = f"""
+                formatted_prompt = """
                     <|begin_of_text|><|start_header_id|>user<|end_header_id|>
-                    You are given multiple short JSON analyses. Combine them into a single plain-text report with the following sections:
-
+                    You are given multiple short JSON analyses in this session
+                    Use the session id to access those JSON's context
+                    Combine the analyses into a single plain-text report with sections:
+                    
                     Overall Summary:
-                    Write 1–2 concise paragraphs summarizing the key findings.
-
+                      Write 1–2 concise paragraphs summarizing the key findings.
+                    
                     Top Issues:
-                    List the most critical issues in this format:
-                    1. <Short issue title — file/path:line — 1–2 sentence explanation>
-
+                      List the most critical issues in this format:
+                      1. <Short issue title — file/path:line — 1–2 sentence explanation>
+                    
                     Remediation Plan:
-                    Provide actionable steps in this format:
-                    1. <Concrete step>
+                      Provide actionable steps in this format:
+                      1. <Concrete step>
 
-                    JSON Inputs:
-                    {synth_inputs_trimmed}
                     Produce the report now.
                     <|eot_id|>
                     <|start_header_id|>assistant<|end_header_id|>
@@ -471,12 +600,10 @@ def analyze_git_repo(repo_url: str) -> str:
                 if len(synth_inputs_trimmed) > max_synth_chars:
                     synth_inputs_trimmed = synth_inputs_trimmed[:max_synth_chars].rsplit("\n", 1)[0]
 
-                synth_prompt = formatted_prompt.replace("{synth_inputs_trimmed}", synth_inputs_trimmed)
-
                 # build and persist synthesis payload (include model-specific max output)
                 synthesized = ""   # ensure variable always exists
-                max_out = int(os.getenv("BEDROCK_MAX_TOKENS", "8194"))
-                synth_payload = {"prompt": synth_prompt}
+                max_out = int(os.getenv("BEDROCK_MAX_TOKENS", "4096"))
+                synth_payload = {"prompt": formatted_prompt}
 
                 try:
                     synth_fn = os.path.join(payload_dir, "synth_payload.json")
@@ -485,7 +612,7 @@ def analyze_git_repo(repo_url: str) -> str:
                 except Exception:
                     logging.exception("Failed to save synth payload")
 
-                # invoke bedrock for final synthesis (with retry wrapper)
+                # invoke bedrock for final synthesis (with streaming retry wrapper)
                 try:
                     # small pause to reduce throttle risk
                     try:
@@ -493,18 +620,24 @@ def analyze_git_repo(repo_url: str) -> str:
                     except Exception:
                         pass
 
-                    resp = bedrock.invoke_model(
-                        modelId="meta.llama3-70b-instruct-v1:0",  # or llama3-8b-instruct-v1:0
-                        contentType="application/json",
-                        accept="application/json",
-                        body=json.dumps(synth_payload)
-                    )
-
-                    body_obj = resp.get("body")
-                    if hasattr(body_obj, "read"):
-                        synthesized = body_obj.read().decode("utf-8", "replace")
-                    else:
-                        synthesized = str(body_obj or "")
+                    # use streaming wrapper which will retry on throttles and read incrementally
+                    synthesized = bedrock_converse_stream_with_retry(
+                        bedrock,
+                        model_id=model_id or "anthropic.claude-3-haiku-20240307-v1:0",
+                        messages=[
+                            {"role": "user", "content": [{"text": formatted_prompt}]}
+                        ],
+                        inference_config={"temperature": 0.3, "maxTokens": max_out},
+                        session_id=session_id  # pass session id so Bedrock can use session context
+                    )["body"].read().decode("utf-8", errors="replace") if isinstance(bedrock_converse_stream_with_retry(
+                        bedrock,
+                        model_id=model_id or "anthropic.claude-3-haiku-20240307-v1:0",
+                        messages=[
+                            {"role": "user", "content": [{"text": formatted_prompt }]}
+                        ],
+                        inference_config={"temperature": 0.3, "maxTokens": max_out},
+                        session_id=session_id
+                    ), dict) else ""
                 except Exception:
                     logging.exception("Final Bedrock synthesis failed")
                     report += "\n\n--- Bedrock synthesis failed; see agent logs ---\n"
@@ -598,41 +731,7 @@ def analyze_git_repo(repo_url: str) -> str:
         else:
             logging.info("Preserving cloned repo at %s (not removed). Set KEEP_PAYLOADS=0 to enable cleanup.", repo_path)
 
-def safe_bedrock_invoke(client, modelId: str, payload_candidates: list, contentType="application/json", accept="application/json", **invoke_kwargs):
-    """
-    Try a list of payload dicts until one succeeds. On Malformed input / extraneous key errors
-    try the next candidate. Uses bedrock_invoke_with_retry for retry/backoff.
-    """
-    last_exc = None
-    for idx, p in enumerate(payload_candidates, start=1):
-        try:
-            logging.debug("Trying bedrock payload variant %d for model %s (keys=%s)", idx, modelId, list(p.keys()))
-            resp = bedrock_invoke_with_retry(
-                client,
-                modelId=modelId,
-                body=json.dumps(p),
-                contentType=contentType,
-                accept=accept,
-                **invoke_kwargs,
-            )
-            # success
-            return resp, p
-        except Exception as e:
-            last_exc = e
-            msg = str(e).lower()
-            # if error indicates malformed input / extraneous key, try next candidate
-            if "malformed input" in msg or "extraneous key" in msg or "validationexception" in msg or "not permitted" in msg:
-                logging.warning("Payload variant %d rejected by model (%s). Trying next payload variant.", idx, modelId)
-                continue
-            # otherwise, surface the error immediately
-            raise
-    # exhausted candidates
-    logging.exception("All payload candidates failed for model %s", modelId)
-    raise last_exc if last_exc is not None else RuntimeError("No payload candidates provided")
-
 if __name__ == "__main__":
     logging.info("Starting MCP agent (streamable-http) on 0.0.0.0:8000")
     # adjust transport/host/port if you need a different setup
     mcp.run(transport="streamable-http")
-
-
