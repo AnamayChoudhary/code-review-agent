@@ -14,6 +14,8 @@ import random
 import uuid
 from collections import deque
 import io
+import concurrent.futures
+import threading
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -440,101 +442,127 @@ def analyze_git_repo(repo_url: str) -> str:
 
                 # rate limit control: seconds to wait between per-chunk Bedrock calls
                 per_chunk_delay = float(os.getenv("PER_CHUNK_DELAY", "3.0"))
+                # concurrency for per-chunk calls
+                max_workers = max(1, int(os.getenv("PER_CHUNK_CONCURRENCY", "3")))
 
                 # context window: keep last N parsed analyses and use them for final synthesis
                 CONTEXT_WINDOW = int(os.getenv("CONTEXT_WINDOW", "15"))
                 recent_context = deque(maxlen=CONTEXT_WINDOW)
 
-                for i, chunk_text in enumerate(chunks, start=1):
-                    part_prompt_instructions = (
-                        f"PART {i}/{len(chunks)}\n"
-                        "You are an automated code reviewer. For the files below, produce a short JSON object with keys:\n"
-                        "  summary: short plain-text summary\n"
-                        "  issues: list of short issue descriptions\n"
-                        "  recommendations: list of short actionable suggestions\n\n"
-                        "Return ONLY valid JSON.\n\n"
-                    )
-
-                    # Ensure part prompt does not exceed model token budget (heuristic ~4 chars/token)
-                    available_tokens = max(1, MODEL_TOKEN_LIMIT - TOKEN_RESERVE)
-                    def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
-                        max_chars = max(64, max_tokens * 4)
-                        if len(text) <= max_chars:
-                            return text
-                        # try to cut at a newline boundary near the truncation point for nicer splits
-                        cut = text.rfind("\n", 0, max_chars)
-                        if cut <= 0:
-                            cut = max_chars
-                        return text[:cut] + "\n\n...TRUNCATED...\n\n"
-
-                    # build final part prompt with truncation if needed
-                    instr_len_tokens = estimate_tokens(part_prompt_instructions)
-                    allowed_tokens_for_chunk = max(10, available_tokens - instr_len_tokens)
-                    safe_chunk_text = truncate_text_to_tokens(chunk_text, allowed_tokens_for_chunk)
-                    part_prompt = part_prompt_instructions + safe_chunk_text
-
-                    # include model-specific max-output tokens so models don't default to tiny outputs
-                    max_out = int(os.getenv("BEDROCK_MAX_TOKENS", "512"))
-                    if "meta.llama3" in model_id or "llama3" in model_id:
-                        # meta llama expects max_output_tokens
-                        part_payload = {"prompt": part_prompt}
-                    elif "anthropic" in model_id or "claude" in model_id:
-                        part_payload = {"input": part_prompt, "max_tokens_to_sample": max_out}
-                    else:
-                        # other runtimes may accept max_tokens_to_sample
-                        part_payload = {"prompt": part_prompt, "max_tokens_to_sample": max_out}
-
+                # worker that processes one chunk and returns parsed_obj (or error dict)
+                def process_chunk(i, chunk_text):
                     try:
-                        part_fn = os.path.join(payload_dir, f"part_{i:03d}.json")
-                        with open(part_fn, "w", encoding="utf-8") as pf:
-                            json.dump(part_payload, pf, indent=2, ensure_ascii=False)
-                    except Exception:
-                        logging.exception("Failed to save part payload")
-
-                    try:
-                        # use streaming wrapper for per-chunk analysis
-                        decoded = bedrock_converse_stream_with_retry(
-                            bedrock,
-                            model_id=model_id,
-                            messages=[
-                                {"role": "user", "content": [{"text": part_prompt}]}
-                            ],
-                            inference_config={
-                                "temperature": 0.7,
-                                "maxTokens": 512
-                            },
-                            session_id=session_id  # pass session id for multi-turn context
+                        part_prompt_instructions = (
+                            f"PART {i}/{len(chunks)}\n"
+                            "You are an automated code reviewer. For the files below, produce a short JSON object with keys:\n"
+                            "  summary: short plain-text summary\n"
+                            "  issues: list of short issue descriptions\n"
+                            "  recommendations: list of short actionable suggestions\n\n"
+                            "Return ONLY valid JSON.\n\n"
                         )
+                        available_tokens = max(1, MODEL_TOKEN_LIMIT - TOKEN_RESERVE)
+                        def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+                            max_chars = max(64, int(max_tokens * 4))
+                            if len(text) <= max_chars:
+                                return text
+                            cut = text.rfind("\n", 0, max_chars)
+                            if cut <= 0:
+                                cut = max_chars
+                            return text[:cut] + "\n\n...TRUNCATED...\n\n"
 
-                        # decoded is a str
-                    except Exception as ex:
-                        logging.exception("Per-chunk Bedrock call failed")
-                        analyses.append({"error": str(ex)})
-                        # backoff pause after error to avoid immediate retries
-                        try:
-                            time.sleep(per_chunk_delay)
-                        except Exception:
-                            time.sleep(0.5)
+                        instr_len_tokens = estimate_tokens(part_prompt_instructions)
+                        allowed_tokens_for_chunk = max(10, available_tokens - instr_len_tokens)
+                        safe_chunk_text = truncate_text_to_tokens(chunk_text, allowed_tokens_for_chunk)
+                        part_prompt = part_prompt_instructions + safe_chunk_text
 
-                    # attach metadata and maintain recent_context
-                    try:
-                        parsed_obj = None
-                        try:
-                            parsed_obj = json.loads(decoded)
-                        except Exception:
-                            parsed_obj = {"generation": decoded.strip()}
-                        # enrich with part metadata for the synthesizer
-                        parsed_obj.setdefault("part_index", i)
-                        parsed_obj.setdefault("total_parts", len(chunks))
-                        parsed_obj.setdefault("repo_path", repo_path)
-                        analyses.append(parsed_obj)
-                        if 'recent_context' in locals():
-                            recent_context.append(parsed_obj)
+                        # include model-specific max-output tokens so models don't default to tiny outputs
+                        requested_out = int(os.getenv("BEDROCK_MAX_TOKENS", "512"))
+                        max_out_local = clamp_tokens_for_model(model_id or "", requested_out) if 'clamp_tokens_for_model' in globals() else requested_out
+
+                        if "meta.llama3" in model_id or "llama3" in model_id:
+                            part_payload = {"prompt": part_prompt}
+                        elif "anthropic" in model_id or "claude" in model_id:
+                            part_payload = {"input": part_prompt, "max_tokens_to_sample": max_out_local}
                         else:
-                            # create recent_context if not present
-                            recent_context = deque([parsed_obj], maxlen=int(os.getenv("CONTEXT_WINDOW", "5")))
+                            part_payload = {"prompt": part_prompt, "max_tokens_to_sample": max_out_local}
+
+                        # persist payload for inspection
+                        try:
+                            part_fn = os.path.join(payload_dir, f"part_{i:03d}.json")
+                            with open(part_fn, "w", encoding="utf-8") as pf:
+                                json.dump(part_payload, pf, indent=2, ensure_ascii=False)
+                        except Exception:
+                            logging.debug("Failed to save part payload", exc_info=True)
+
+                        # call bedrock (streaming wrapper)
+                        try:
+                            resp = bedrock_converse_stream_with_retry(
+                                bedrock,
+                                model_id=model_id,
+                                messages=[{"role": "user", "content": [{"text": part_prompt}]}],
+                                inference_config={"temperature": 0.7, "maxTokens": max_out_local},
+                                session_id=session_id
+                            )
+                            # normalize to decoded string
+                            body_obj = resp.get("body") if isinstance(resp, dict) else resp
+                            if hasattr(body_obj, "read"):
+                                decoded = body_obj.read().decode("utf-8", errors="replace")
+                            elif isinstance(body_obj, bytes):
+                                decoded = body_obj.decode("utf-8", errors="replace")
+                            else:
+                                decoded = str(body_obj or "")
+                        except Exception as ex:
+                            logging.exception("Per-chunk Bedrock call failed (worker)")
+                            return {"error": str(ex), "part_index": i}
+
+                        # attempt JSON parse
+                        try:
+                            parsed = json.loads(decoded)
+                        except Exception:
+                            parsed = {"generation": decoded.strip()}
+
+                        # attach metadata
+                        parsed.setdefault("part_index", i)
+                        parsed.setdefault("total_parts", len(chunks))
+                        parsed.setdefault("repo_path", repo_path)
+                        return parsed
+                    finally:
+                        # small pause before worker exits to help spacing
+                        try:
+                            time.sleep(per_chunk_delay * 0.25)
+                        except Exception:
+                            pass
+
+                # submit tasks with bounded executor and collect results, then reassemble in order
+                results_by_index = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exe:
+                    futures = {}
+                    for i, chunk_text in enumerate(chunks, start=1):
+                        fut = exe.submit(process_chunk, i, chunk_text)
+                        futures[fut] = i
+                        # space submissions slightly to avoid bursts
+                        try:
+                            time.sleep(per_chunk_delay / max(1, max_workers))
+                        except Exception:
+                            pass
+
+                    for fut in concurrent.futures.as_completed(futures):
+                        idx = futures[fut]
+                        try:
+                            res = fut.result()
+                        except Exception as e:
+                            logging.exception("Per-chunk worker raised", exc_info=True)
+                            res = {"error": str(e), "part_index": idx}
+                        results_by_index[idx] = res
+
+                # append results in part order to analyses and recent_context
+                for idx in range(1, len(chunks) + 1):
+                    parsed_obj = results_by_index.get(idx, {"error": "missing result", "part_index": idx})
+                    analyses.append(parsed_obj)
+                    try:
+                        recent_context.append(parsed_obj)
                     except Exception:
-                        logging.debug("Failed to attach part metadata to context", exc_info=True)
+                        pass
 
                 # Build a compact / safe synth prompt that keeps total tokens below the model limit
                 # Use the recent context (last few parsed analyses) rather than the full analyses list
@@ -620,24 +648,25 @@ def analyze_git_repo(repo_url: str) -> str:
                     except Exception:
                         pass
 
-                    # use streaming wrapper which will retry on throttles and read incrementally
-                    synthesized = bedrock_converse_stream_with_retry(
+                    # call once (avoid duplicate network call)
+                    resp = bedrock_converse_stream_with_retry(
                         bedrock,
                         model_id=model_id or "anthropic.claude-3-haiku-20240307-v1:0",
                         messages=[
-                            {"role": "user", "content": [{"text": formatted_prompt}]}
+                            {"role": "user", "content": [{"text": formatted_prompt + "\n\nJSON_INPUTS:\n" + synth_inputs_trimmed}]}
                         ],
                         inference_config={"temperature": 0.3, "maxTokens": max_out},
                         session_id=session_id  # pass session id so Bedrock can use session context
-                    )["body"].read().decode("utf-8", errors="replace") if isinstance(bedrock_converse_stream_with_retry(
-                        bedrock,
-                        model_id=model_id or "anthropic.claude-3-haiku-20240307-v1:0",
-                        messages=[
-                            {"role": "user", "content": [{"text": formatted_prompt }]}
-                        ],
-                        inference_config={"temperature": 0.3, "maxTokens": max_out},
-                        session_id=session_id
-                    ), dict) else ""
+                    )
+
+                    # read body robustly
+                    body_obj = resp.get("body") if isinstance(resp, dict) else resp
+                    if hasattr(body_obj, "read"):
+                        synthesized = body_obj.read().decode("utf-8", errors="replace")
+                    elif isinstance(body_obj, bytes):
+                        synthesized = body_obj.decode("utf-8", errors="replace")
+                    else:
+                        synthesized = str(body_obj or "")
                 except Exception:
                     logging.exception("Final Bedrock synthesis failed")
                     report += "\n\n--- Bedrock synthesis failed; see agent logs ---\n"
