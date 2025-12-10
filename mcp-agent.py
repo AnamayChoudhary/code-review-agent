@@ -864,7 +864,38 @@ def analyze_git_repo(repo_url: str,
         else:
             logging.info("Preserving cloned repo at %s (not removed). Set KEEP_PAYLOADS=0 to enable cleanup.", repo_path)
 
+@mcp.tool()
+def github_webhook(payload: dict, headers: dict = None) -> str:
+    """
+    Minimal GitHub webhook receiver.
+    Accepts pull_request events and triggers analysis.
+    """
+    hdrs = headers or {}
+    event = hdrs.get("X-GitHub-Event", hdrs.get("x-github-event", ""))
+    if event != "pull_request":
+        return f"ignored event: {event}"
+
+    action = payload.get("action")
+    if action not in ("opened", "synchronize", "reopened", "ready_for_review"):
+        return f"ignored action: {action}"
+
+    pr = payload.get("pull_request", {}) or {}
+    number = pr.get("number")
+    repo = payload.get("repository", {}) or {}
+    clone_url = repo.get("clone_url") or repo.get("git_url") or repo.get("ssh_url")
+
+    # Run analysis in a background thread so webhook returns quickly
+    import threading
+    def worker():
+        try:
+            analyze_git_repo(clone_url, pr_number=number)
+        except Exception as e:
+            logging.exception("Webhook analysis failed")
+    threading.Thread(target=worker, daemon=True).start()
+    return f"accepted PR #{number} for analysis"
+
 if __name__ == "__main__":
     logging.info("Starting MCP agent (streamable-http) on 0.0.0.0:8000")
     # adjust transport/host/port if you need a different setup
     mcp.run(transport="streamable-http")
+
