@@ -16,6 +16,10 @@ from collections import deque
 import io
 import concurrent.futures
 import threading
+from typing import Optional, Dict
+import hmac
+import hashlib
+import requests
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -174,7 +178,16 @@ def bedrock_converse_stream_with_retry(client, model_id: str, messages: list = N
 
 
 @mcp.tool()
-def analyze_git_repo(repo_url: str) -> str:
+def analyze_git_repo(repo_url: str,
+                     pr_number: Optional[int] = None,
+                     pr_patch: Optional[str] = None,
+                     pr_changes: Optional[Dict[str, str]] = None) -> str:
+    """
+    Analyze a repo. Optional PR parameters:
+      - pr_number: fetch and checkout pull/{N}/head
+      - pr_patch: apply a patch string to the cloned repo
+      - pr_changes: dict of path->content to write and commit
+    """
     # use a temp directory to avoid collisions and be cross-platform
     # Option for a Webhook interation
     repo_path = tempfile.mkdtemp(prefix="code_review_repo_")
@@ -191,39 +204,182 @@ def analyze_git_repo(repo_url: str) -> str:
     try:
         try:
             Repo.clone_from(repo_url, repo_path)
-        except git_exc.InvalidGitRepositoryError as e:
-            logging.exception("InvalidGitRepositoryError cloning repo (gitpython)")
-            # directory contents for diagnosis
+        except Exception as clone_exc:
+            logging.exception("Error cloning repo")
+            return f"Failed to clone repo: {clone_exc}"
+
+        # --- apply PR / patch / file-changes if provided ---
+        def apply_pr_to_clone():
             try:
-                listing = "\n".join(os.listdir(repo_path))
+                repo = Repo(repo_path)
+                if pr_number is not None:
+                    fetch_ref = f"pull/{int(pr_number)}/head:pr-{int(pr_number)}"
+                    logging.info("Fetching PR ref %s", fetch_ref)
+                    try:
+                        repo.remotes.origin.fetch(fetch_ref)
+                        repo.git.checkout(f"pr-{int(pr_number)}")
+                        return True, f"Checked out PR #{pr_number}"
+                    except Exception as e:
+                        logging.warning("Fetching PR ref failed: %s", e)
+                        # fallback to downloading patch
+                        pr_patch_url = None
+                        try:
+                            # try common GitHub patch URL
+                            owner = repo.remotes.origin.url.split("/")[-2]
+                        except Exception:
+                            pr_patch_url = None
+                        if pr_patch_url is None:
+                            pr_patch_url = None
+                if pr_patch:
+                    patch_file = os.path.join(repo_path, "pr.patch")
+                    with open(patch_file, "w", encoding="utf-8") as pf:
+                        pf.write(pr_patch)
+                    res = subprocess.run(["git", "apply", "--index", patch_file], cwd=repo_path, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        logging.warning("git apply failed: %s", res.stderr)
+                        return False, f"git apply failed: {res.stderr}"
+                    repo.index.commit(f"Apply PR patch")
+                    return True, "Applied patch"
+                if pr_changes:
+                    for path, content in pr_changes.items():
+                        full = os.path.join(repo_path, path)
+                        os.makedirs(os.path.dirname(full), exist_ok=True)
+                        with open(full, "w", encoding="utf-8") as fh:
+                            fh.write(content)
+                        repo.git.add(path)
+                    repo.index.commit("Apply PR changes via webhook")
+                    return True, "Wrote pr_changes and committed"
             except Exception as ex:
-                listing = f"<error listing dir: {ex}>"
-            # fallback to subprocess to capture raw git output
+                logging.exception("Failed to apply PR changes")
+                return False, str(ex)
+            return False, "no pr input provided"
+
+        applied, info = apply_pr_to_clone()
+        logging.info("PR apply result: %s %s", applied, info)
+
+        # --- New: analyze PR diff directly with Bedrock ---
+        def _get_pr_diff_text():
             try:
-                proc = subprocess.run(
-                    ["git", "clone", repo_url, repo_path],
-                    capture_output=True, text=True, check=False
+                repo = Repo(repo_path)
+                if pr_patch:
+                    return pr_patch
+                if pr_changes:
+                    parts = []
+                    for p, content in pr_changes.items():
+                        parts.append(f"--- a/{p}\n+++ b/{p}\n")
+                        parts.append(content)
+                    return "\n\n".join(parts)
+                if pr_number is not None:
+                    pr_branch = f"pr-{pr_number}"
+                    try:
+                        repo.remotes.origin.fetch()
+                        repo.remotes.origin.fetch(f"pull/{int(pr_number)}/head:{pr_branch}")
+                        repo.remotes.origin.fetch("main")
+                        diff = repo.git.diff(f"origin/main...{pr_branch}")
+                        if diff and diff.strip():
+                            return diff
+                    except Exception:
+                        pass
+                # fallback: show HEAD diff
+                try:
+                    diff = repo.git.diff("HEAD~10..HEAD")
+                    if diff and diff.strip():
+                        return diff
+                except Exception:
+                    pass
+                try:
+                    return repo.git.show("HEAD")
+                except Exception:
+                    return ""
+            except Exception:
+                return ""
+
+        MODEL_TOKEN_LIMIT = int(os.getenv("MODEL_TOKEN_LIMIT", os.getenv("BEDROCK_MODEL_TOKEN_LIMIT", "200000")))
+        TOKEN_RESERVE = int(os.getenv("TOKEN_RESERVE", "512"))
+        AVG_CHARS_PER_TOKEN = float(os.getenv("AVG_CHARS_PER_TOKEN", "3.0"))
+
+        def analyze_pr_with_bedrock(diff_text: str, pr_id: Optional[int] = None):
+            region = os.getenv("AWS_REGION", "us-east-1")
+            model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+            bedrock = boto3.client("bedrock-runtime", region_name=region)
+            if not diff_text:
+                return None
+            # small local truncator to avoid exceeding model token window
+            def _truncate_for_model(text: str, max_chars: int):
+                if len(text) <= max_chars:
+                    return text
+                cut = text.rfind("\n", 0, max_chars)
+                if cut <= 0:
+                    cut = max_chars
+                return text[:cut] + "\n\n...TRUNCATED...\n\n"
+
+            requested_out = int(os.getenv("BEDROCK_MAX_TOKENS", "4096"))
+            max_out = clamp_tokens_for_model(model_id or "", requested_out) if 'clamp_tokens_for_model' in globals() else requested_out
+            # compute safe body size in chars from token heuristic
+            safe_chars = int(200000)
+            diff_trimmed = _truncate_for_model(diff_text, safe_chars)
+
+            # save trimmed diff to payloads for inspection
+            try:
+                payload_dir = os.path.join(repo_path, "bedrock_payloads")
+                os.makedirs(payload_dir, exist_ok=True)
+                pr_diff_fn = os.path.join(payload_dir, f"pr_{pr_id or 'unknown'}_diff.txt")
+                with open(pr_diff_fn, "w", encoding="utf-8") as pf:
+                    pf.write(diff_trimmed)
+                logging.info("Saved trimmed PR diff to %s", pr_diff_fn)
+            except Exception:
+                logging.debug("Failed to save trimmed PR diff", exc_info=True)
+
+            pr_label = f"PR #{pr_id}" if pr_id else "PR changes"
+            pr_prompt = (
+                f"{pr_label}: Analyze the proposed changes and their impact on the repository.\n\n"
+                "Return ONLY valid JSON with keys: summary (short), impacted_files (list), "
+                "issues (list of {title,file,line,desc}), recommendations (list of short actionable steps).\n\n"
+                "Be specific to the diff context provided.\n\n"
+            )
+
+            try:
+                resp = bedrock_converse_stream_with_retry(
+                    bedrock,
+                    model_id=model_id,
+                    messages=[{"role": "user", "content": [{"text": pr_prompt + '\n\nDIFF:\n' + diff_trimmed}]}],
+                    inference_config={"temperature": 0.5, "maxTokens": max_out},
+                    session_id=session_id
                 )
-                details = f"subprocess returncode={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-            except FileNotFoundError:
-                logging.exception("git executable not found for subprocess fallback")
-                return "Failed to clone repo: 'git' executable not found. Install Git and ensure it's on PATH (run 'git --version')."
-            return f"Failed to clone repo: InvalidGitRepositoryError: {e}\nDirectory listing:\n{listing}\n\nSubprocess output:\n{details}"
-        except git_exc.GitCommandError as e:
-            # Git command ran but failed (captures stderr/status)
-            stderr = getattr(e, "stderr", None)
-            logging.exception("GitCommandError cloning repo")
-            details = f"{e}"
-            if stderr:
-                details += f"\nstderr: {stderr}"
-            return f"Failed to clone repo: {details}"
-        except FileNotFoundError as e:
-            # Typically means the 'git' executable is not found on PATH
-            logging.exception("git executable not found")
-            return "Failed to clone repo: 'git' executable not found. Install Git and ensure it's on PATH (run 'git --version')."
-        except Exception as e:
-            logging.exception("Unexpected error cloning repo")
-            return f"Failed to clone repo: {e.__class__.__name__}: {e}"
+                body_obj = resp.get("body") if isinstance(resp, dict) else resp
+                if hasattr(body_obj, "read"):
+                    decoded = body_obj.read().decode("utf-8", errors="replace")
+                elif isinstance(body_obj, bytes):
+                    decoded = body_obj.decode("utf-8", errors="replace")
+                else:
+                    decoded = str(body_obj or "")
+            except Exception as e:
+                logging.exception("PR Bedrock analysis failed")
+                return {"error": str(e)}
+
+            try:
+                parsed = json.loads(decoded)
+            except Exception:
+                parsed = {"generation": decoded.strip()}
+            parsed.setdefault("repo_path", repo_path)
+            parsed.setdefault("pr_number", pr_number)
+            return parsed
+
+        # Run quick PR-focused analysis and add to the analyses/context so synth uses it
+        pr_section = ""
+        try:
+            pr_diff = _get_pr_diff_text()
+            pr_result = analyze_pr_with_bedrock(pr_diff, pr_number)
+            pr_section = pr_result
+            if pr_result:
+                # prepend PR analysis so synth sees it first
+                analyses = locals().get("analyses", [])
+                if isinstance(analyses, list):
+                    analyses.insert(0, pr_result)
+                if 'recent_context' in locals():
+                    recent_context.appendleft(pr_result) if hasattr(recent_context, "appendleft") else recent_context.append(pr_result)
+        except Exception:
+            logging.exception("Failed to run PR-specific Bedrock analysis")
 
         # Run flake8 for linting (if installed)
         if shutil.which("flake8"):
@@ -461,6 +617,7 @@ def analyze_git_repo(repo_url: str) -> str:
                             "Return ONLY valid JSON.\n\n"
                         )
                         available_tokens = max(1, MODEL_TOKEN_LIMIT - TOKEN_RESERVE)
+
                         def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
                             max_chars = max(64, int(max_tokens * 4))
                             if len(text) <= max_chars:
@@ -475,18 +632,17 @@ def analyze_git_repo(repo_url: str) -> str:
                         safe_chunk_text = truncate_text_to_tokens(chunk_text, allowed_tokens_for_chunk)
                         part_prompt = part_prompt_instructions + safe_chunk_text
 
-                        # include model-specific max-output tokens so models don't default to tiny outputs
+                        # include model-specific max-output tokens
                         requested_out = int(os.getenv("BEDROCK_MAX_TOKENS", "512"))
                         max_out_local = clamp_tokens_for_model(model_id or "", requested_out) if 'clamp_tokens_for_model' in globals() else requested_out
 
-                        if "meta.llama3" in model_id or "llama3" in model_id:
+                        if "meta.llama3" in (model_id or "") or "llama3" in (model_id or ""):
                             part_payload = {"prompt": part_prompt}
-                        elif "anthropic" in model_id or "claude" in model_id:
+                        elif "anthropic" in (model_id or "") or "claude" in (model_id or ""):
                             part_payload = {"input": part_prompt, "max_tokens_to_sample": max_out_local}
                         else:
                             part_payload = {"prompt": part_prompt, "max_tokens_to_sample": max_out_local}
 
-                        # persist payload for inspection
                         try:
                             part_fn = os.path.join(payload_dir, f"part_{i:03d}.json")
                             with open(part_fn, "w", encoding="utf-8") as pf:
@@ -503,7 +659,6 @@ def analyze_git_repo(repo_url: str) -> str:
                                 inference_config={"temperature": 0.7, "maxTokens": max_out_local},
                                 session_id=session_id
                             )
-                            # normalize to decoded string
                             body_obj = resp.get("body") if isinstance(resp, dict) else resp
                             if hasattr(body_obj, "read"):
                                 decoded = body_obj.read().decode("utf-8", errors="replace")
@@ -515,19 +670,16 @@ def analyze_git_repo(repo_url: str) -> str:
                             logging.exception("Per-chunk Bedrock call failed (worker)")
                             return {"error": str(ex), "part_index": i}
 
-                        # attempt JSON parse
                         try:
                             parsed = json.loads(decoded)
                         except Exception:
                             parsed = {"generation": decoded.strip()}
 
-                        # attach metadata
                         parsed.setdefault("part_index", i)
                         parsed.setdefault("total_parts", len(chunks))
                         parsed.setdefault("repo_path", repo_path)
                         return parsed
                     finally:
-                        # small pause before worker exits to help spacing
                         try:
                             time.sleep(per_chunk_delay * 0.25)
                         except Exception:
@@ -563,41 +715,6 @@ def analyze_git_repo(repo_url: str) -> str:
                         recent_context.append(parsed_obj)
                     except Exception:
                         pass
-
-                # Build a compact / safe synth prompt that keeps total tokens below the model limit
-                # Use the recent context (last few parsed analyses) rather than the full analyses list
-                ctx_list = list(recent_context) if 'recent_context' in locals() else analyses
-                summarized = []
-                for a in ctx_list:
-                    entry = {}
-                    # attach lightweight metadata for better synthesis context
-                    # prefer explicit part index keys if the per-part parser added them,
-                    # otherwise leave as null/unknown
-                    entry["part_index"] = a.get("part_index") if isinstance(a, dict) else None
-                    entry["total_parts"] = a.get("total_parts") if isinstance(a, dict) else len(chunks)
-                    entry["repo_path"] = repo_path
-
-                    # prefer explicit keys if present, else try to extract from raw generation
-                    if isinstance(a, dict):
-                        entry["summary"] = (a.get("summary") or a.get("generation") or "")[:1000]
-                        issues = a.get("issues") or []
-                        if isinstance(issues, list):
-                            entry["issues"] = issues[:5]
-                        else:
-                            entry["issues"] = [str(issues)[:200]]
-                        recs = a.get("recommendations") or []
-                        if isinstance(recs, list):
-                            entry["recommendations"] = recs[:5]
-                        else:
-                            entry["recommendations"] = [str(recs)[:200]]
-                    else:
-                        entry["summary"] = str(a)[:1000]
-                        entry["issues"] = []
-                        entry["recommendations"] = []
-                    summarized.append(entry)
-
-                synth_inputs_trimmed = json.dumps(summarized, indent=2, ensure_ascii=False)
-                # ensure synth prompt stays within token budget
                 
                 formatted_prompt = """
                     <|begin_of_text|><|start_header_id|>user<|end_header_id|>
@@ -620,13 +737,6 @@ def analyze_git_repo(repo_url: str) -> str:
                     <|eot_id|>
                     <|start_header_id|>assistant<|end_header_id|>
                     """
-
-                # available tokens for synth body (reserve output tokens)
-                synth_allowed_tokens = max(64, MODEL_TOKEN_LIMIT - TOKEN_RESERVE - estimate_tokens(formatted_prompt))
-                # truncate the JSON dump if necessary (heuristic)
-                max_synth_chars = max(256, synth_allowed_tokens * 4)
-                if len(synth_inputs_trimmed) > max_synth_chars:
-                    synth_inputs_trimmed = synth_inputs_trimmed[:max_synth_chars].rsplit("\n", 1)[0]
 
                 # build and persist synthesis payload (include model-specific max output)
                 synthesized = ""   # ensure variable always exists
@@ -653,7 +763,7 @@ def analyze_git_repo(repo_url: str) -> str:
                         bedrock,
                         model_id=model_id or "anthropic.claude-3-haiku-20240307-v1:0",
                         messages=[
-                            {"role": "user", "content": [{"text": formatted_prompt + "\n\nJSON_INPUTS:\n" + synth_inputs_trimmed}]}
+                            {"role": "user", "content": [{"text": formatted_prompt }]}
                         ],
                         inference_config={"temperature": 0.3, "maxTokens": max_out},
                         session_id=session_id  # pass session id so Bedrock can use session context
@@ -693,34 +803,28 @@ def analyze_git_repo(repo_url: str) -> str:
 
                 # --- Final report assembly ---
                 # Combine all parts: initial report, per-repo analysis, Bedrock summary, and synthesis
+                # include PR-specific analysis if available
+
+                pr_section = json.dumps(pr_section, indent=2, ensure_ascii=False)
+
                 final_report = [
                     "=== Code Review Report ===",
                     "",
-                    "=== Initial Report (Linting + Complexity) ===",
-                    report.strip(),
-                    "",
-                    "=== Per-Repo Analysis (Bedrock) ===",
+                    "=== Pull Request Analysis (Bedrock) ===",
+                    pr_section,
                 ]
 
-                # Add per-repo analyses (JSON) with formatting
-                for i, analysis in enumerate(analyses, start=1):
-                    final_report.append(f"--- Analysis Part {i} ---")
-                    final_report.append("")
-                    final_report.append(json.dumps(analysis, indent=2, ensure_ascii=False))
-                    final_report.append("")
-
                 final_report += [
-                    "=== Bedrock Model Summary ===",
-                    "",
-                    summary,
-                    "",
                     "=== Final Synthesized Report ===",
                     "",
                     synthesized.strip(),
                     "",
+                    "=== Linting and Complexity Summary ===",
+                    "",
+                    summary,
+                    "",
                     "=== End of Report ===",
                 ]
-
                 # Join all parts with double newlines, ensuring no trailing newlines at the end
                 final_report_text = "\n\n".join(final_report).strip()
 
